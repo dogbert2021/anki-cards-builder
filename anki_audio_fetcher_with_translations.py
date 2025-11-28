@@ -29,15 +29,24 @@ BASE_URL = "https://www.oxfordlearnersdictionaries.com"
 AUDIO_BASE = f"{BASE_URL}/media/english/us_pron_ogg"
 ONELOOK_BASE = "https://onelook.com"
 
-def get_onelook_definition_selenium(word, delay_range=(2, 6)):
+def create_selenium_driver():
+    """Create a single headless Chrome driver for OneLook scraping."""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--window-size=1200,800")
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+    try:
+        return webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+    except Exception as e:
+        logging.error(f"Failed to create Selenium driver: {e}")
+        return None
 
-    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+def get_onelook_definition_selenium(word, driver, delay_range=(2, 6)):
+    """Fetch OneLook definition using a shared Selenium driver."""
+    if driver is None:
+        return None
 
     url = f"https://www.onelook.com/?w={word}&ls=a"
     try:
@@ -49,7 +58,6 @@ def get_onelook_definition_selenium(word, delay_range=(2, 6)):
         # Find the in-brief definition box
         div = soup.find("div", class_="ol_inbrief")
         definition = ""
-        #print(f" fetching OneLook definition for '{div}'")
  
         if div:
             # Find the span with "Usually means:"
@@ -81,8 +89,6 @@ def get_onelook_definition_selenium(word, delay_range=(2, 6)):
     except Exception as e:
         print(f"Error fetching OneLook definition for '{word}': {e}")
         return None
-    finally:
-        driver.quit()
 
 def get_human_headers():
     """Generate realistic browser headers"""
@@ -285,86 +291,96 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
         successful_audio = 0
         successful_definitions = 0
         successful_onelook = 0
+        driver = create_selenium_driver()
+        if driver is None:
+            print("⚠️  Unable to start Selenium; OneLook definitions will be skipped.")
         
-        for index, row in df.iterrows():
-            word = str(row['Front']).strip()
-            
-            print(f"\n[{index+1}/{total_words}] Processing: '{word}'")
-            
-            # Check if Back column is empty and fetch OneLook definition
-            current_back = row.get('Back', '')
-            if is_empty_value(current_back):
-                print(f"  Fetching OneLook definition...")
-                if verbose:
-                    print(f"  🔍 Debug mode: detailed OneLook analysis for '{word}'")
+        try:
+            for index, row in df.iterrows():
+                word = str(row['Front']).strip()
                 
-                #for word in words:
-                onelook_def = get_onelook_definition_selenium(word)
-                print(f"{word}: {onelook_def}")
-
-
-                if onelook_def:
-                    df.at[index, 'Back'] = onelook_def
-                    successful_onelook += 1
-                    print(f"  ✓ Definition: {onelook_def[:100]}{'...' if len(onelook_def) > 100 else ''}")
-                else:
-                    print(f"  ✗ No definition found")
-            else:
-                print(f"  ↳ Back column already has content, skipping definition fetch")
-            
-            # Find working audio URL
-            print(f"  Searching for audio...")
-            audio_url, filename = find_working_audio_url(word)
-            
-            # Construct definition URL
-            definition_url = construct_definition_url(word)
-            
-            # Check if resources exist
-            has_audio = audio_url is not None
-            has_definition = check_definition_url(definition_url) if definition_url else False
-
-            if not has_audio:
-                logging.warning(f"Audio not found for word: {word}")
-                print(f"  ✗ No audio found")
-            else:
-                print(f"  ✓ Audio found: {filename}")
-                successful_audio += 1
+                print(f"\n[{index+1}/{total_words}] Processing: '{word}'")
                 
-            if not has_definition:
-                logging.warning(f"Definition page not found for word: {word}")
-                print(f"  ✗ Oxford definition page not found")
-            else:
-                print(f"  ✓ Oxford definition page found")
-                successful_definitions += 1
+                # Check if Back column is empty and fetch OneLook definition
+                current_back = row.get('Back', '')
+                if is_empty_value(current_back):
+                    print(f"  Fetching OneLook definition...")
+                    if verbose:
+                        print(f"  🔍 Debug mode: detailed OneLook analysis for '{word}'")
+                    
+                    onelook_def = get_onelook_definition_selenium(word, driver)
+                    print(f"{word}: {onelook_def}")
 
-            # Update DataFrame
-            df.at[index, 'Audio'] = audio_url if has_audio else ""
-            df.at[index, 'Definition'] = definition_url if has_definition else ""
-            df.at[index, 'DL valid'] = has_audio
 
-            # Download audio if found
-            if has_audio:
-                print(f"  Downloading audio...")
-                if download_audio(audio_url, audio_dir):
-                    print(f"  ✓ Audio downloaded successfully")
-                    # Update Back column with Anki sound tag
-                    current_back = str(df.at[index, 'Back']).strip()
-                    if current_back and not is_empty_value(current_back):
-                        # Add sound tag to existing content
-                        df.at[index, 'Back'] = f"{current_back} [sound:{filename}]"
+                    if onelook_def:
+                        df.at[index, 'Back'] = onelook_def
+                        successful_onelook += 1
+                        print(f"  ✓ Definition: {onelook_def[:100]}{'...' if len(onelook_def) > 100 else ''}")
                     else:
-                        df.at[index, 'Back'] = f"[sound:{filename}]"
+                        print(f"  ✗ No definition found")
                 else:
-                    print(f"  ✗ Audio download failed")
-            
-            # Add a delay between words to be respectful to servers
-            # Longer delay after OneLook requests to avoid rate limiting
-            if index < total_words - 1:  # Don't sleep after the last word
-                base_delay = random.uniform(2.0, 4.0)  # Increased base delay
-                # Add extra delay if we made OneLook requests
-                if is_empty_value(current_back) or has_audio:
-                    base_delay *= 1.5
-                time.sleep(base_delay)
+                    print(f"  ↳ Back column already has content, skipping definition fetch")
+                
+                # Find working audio URL
+                print(f"  Searching for audio...")
+                audio_url, filename = find_working_audio_url(word)
+                
+                # Construct definition URL
+                definition_url = construct_definition_url(word)
+                
+                # Check if resources exist
+                has_audio = audio_url is not None
+                has_definition = check_definition_url(definition_url) if definition_url else False
+
+                if not has_audio:
+                    logging.warning(f"Audio not found for word: {word}")
+                    print(f"  ✗ No audio found")
+                else:
+                    print(f"  ✓ Audio found: {filename}")
+                    successful_audio += 1
+                    
+                if not has_definition:
+                    logging.warning(f"Definition page not found for word: {word}")
+                    print(f"  ✗ Oxford definition page not found")
+                else:
+                    print(f"  ✓ Oxford definition page found")
+                    successful_definitions += 1
+
+                # Track download success so DL valid and sound tags only reflect completed downloads
+                download_success = False
+
+                # Download audio if found
+                if has_audio:
+                    print(f"  Downloading audio...")
+                    if download_audio(audio_url, audio_dir):
+                        download_success = True
+                        print(f"  ✓ Audio downloaded successfully")
+                        # Update Back column with Anki sound tag
+                        current_back = str(df.at[index, 'Back']).strip()
+                        if current_back and not is_empty_value(current_back):
+                            # Add sound tag to existing content
+                            df.at[index, 'Back'] = f"{current_back} [sound:{filename}]"
+                        else:
+                            df.at[index, 'Back'] = f"[sound:{filename}]"
+                    else:
+                        print(f"  ✗ Audio download failed")
+
+                # Update DataFrame after attempting download
+                df.at[index, 'Audio'] = audio_url if has_audio else ""
+                df.at[index, 'Definition'] = definition_url if has_definition else ""
+                df.at[index, 'DL valid'] = download_success
+
+                # Add a delay between words to be respectful to servers
+                # Longer delay after OneLook requests to avoid rate limiting
+                if index < total_words - 1:  # Don't sleep after the last word
+                    base_delay = random.uniform(2.0, 4.0)  # Increased base delay
+                    # Add extra delay if we made OneLook requests
+                    if is_empty_value(current_back) or has_audio:
+                        base_delay *= 1.5
+                    time.sleep(base_delay)
+        finally:
+            if driver:
+                driver.quit()
 
         # Save results
         df.to_csv(output_csv, index=False)

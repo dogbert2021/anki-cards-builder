@@ -14,7 +14,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup, NavigableString, Tag
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin, urlparse
 
 
 # Setup logging
@@ -29,6 +29,7 @@ logging.basicConfig(
 BASE_URL = "https://www.oxfordlearnersdictionaries.com"
 AUDIO_BASE = f"{BASE_URL}/media/english/us_pron_ogg"
 ONELOOK_BASE = "https://onelook.com"
+LOCAL_TTS_FALLBACK_MODEL = "/Users/alekseiplotnitskii/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 
 def create_selenium_driver():
     """Create a single headless Chrome driver for OneLook scraping."""
@@ -207,15 +208,217 @@ def construct_candidate_urls(word):
     
     return paths
 
+def extract_audio_urls_from_oxford_html(html):
+    """Extract candidate US audio URLs from Oxford HTML responses."""
+    soup = BeautifulSoup(html, "html.parser")
+    urls = []
+    seen = set()
+
+    for node in soup.select(".sound.audio_play_button.pron-us"):
+        for attr in ("data-src-ogg", "data-src-mp3"):
+            url = node.get(attr)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+    if urls:
+        return urls
+
+    pattern = r'https://www\.oxfordlearnersdictionaries\.com/media/english/(?:us_pron_ogg|us_pron)/[^"\'\s<>]+'
+    for url in re.findall(pattern, html):
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    return urls
+
+def normalize_lookup_text(text):
+    """Normalize text for loose matching across filenames, slugs, and queries."""
+    if not text:
+        return ""
+
+    text = str(text).lower().replace("_", " ").replace("-", " ")
+    text = re.sub(r"(?<=\D)\d+$", "", text)
+    text = re.sub(r"\b\d+\b", " ", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def extract_audio_stem(audio_url):
+    """Extract the lexical stem from an Oxford audio filename."""
+    filename = audio_url.split("/")[-1].rsplit(".", 1)[0]
+    filename = re.sub(r"__(?:us|gb)_\d+(?:_rr)?$", "", filename)
+    if filename.startswith("x") and len(filename) > 1:
+        filename = filename[1:]
+    return filename
+
+def is_relevant_definition_url(url, word):
+    """Check whether a resolved Oxford entry is a close match for the queried word."""
+    if not is_definition_entry_url(url):
+        return False
+
+    slug_norm = normalize_lookup_text(urlparse(url).path.rsplit("/", 1)[-1])
+    word_norm = normalize_lookup_text(word)
+    if not slug_norm or not word_norm:
+        return False
+
+    if slug_norm == word_norm or slug_norm.startswith(f"{word_norm} "):
+        return True
+
+    slug_compact = slug_norm.replace(" ", "")
+    word_compact = word_norm.replace(" ", "")
+
+    if slug_compact == word_compact:
+        return True
+    if word_compact.endswith("s") and slug_compact == word_compact[:-1]:
+        return True
+    if word_compact.endswith("or") and slug_compact == f"{word_compact[:-2]}our":
+        return True
+    if word_compact.endswith("our") and slug_compact == f"{word_compact[:-3]}or":
+        return True
+
+    return False
+
+def is_relevant_audio_url(audio_url, word, page_url=None):
+    """Reject unrelated audio widgets that can appear on some Oxford pages."""
+    audio_norm = normalize_lookup_text(extract_audio_stem(audio_url))
+    if not audio_norm:
+        return False
+
+    use_page_slug = bool(page_url and is_relevant_definition_url(page_url, word))
+    if use_page_slug:
+        comparison_values = [normalize_lookup_text(urlparse(page_url).path.rsplit("/", 1)[-1])]
+    else:
+        comparison_values = [normalize_lookup_text(word)]
+
+    for candidate in comparison_values:
+        if not candidate:
+            continue
+        if audio_norm == candidate:
+            return True
+        if use_page_slug and audio_norm.startswith(f"{candidate} "):
+            return True
+
+        if use_page_slug:
+            audio_tokens = set(audio_norm.split())
+            candidate_tokens = set(candidate.split())
+            if candidate_tokens and candidate_tokens.issubset(audio_tokens):
+                return True
+
+        audio_compact = audio_norm.replace(" ", "")
+        candidate_compact = candidate.replace(" ", "")
+
+        if candidate_compact == audio_compact:
+            return True
+        if candidate_compact.endswith("s") and audio_compact == candidate_compact[:-1]:
+            return True
+        if candidate_compact.endswith("or") and audio_compact == f"{candidate_compact[:-2]}our":
+            return True
+        if candidate_compact.endswith("our") and audio_compact == f"{candidate_compact[:-3]}or":
+            return True
+
+    return False
+
+def is_definition_entry_url(url):
+    """Check whether a URL points to an Oxford definition entry page."""
+    if not url:
+        return False
+
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    return path.startswith("/definition/english/") and path != "/definition/english"
+
+def extract_definition_entry_links(html, base_url):
+    """Extract Oxford definition entry links from a response page."""
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    seen = set()
+
+    for anchor in soup.select("a[href]"):
+        href = urljoin(base_url, anchor.get("href", "").strip())
+        if not is_definition_entry_url(href):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        links.append(href)
+
+    return links
+
+def find_audio_on_oxford_pages(word, max_link_follows=8):
+    """Find audio by parsing Oxford definition/search pages and linked entries."""
+    if not word or pd.isna(word):
+        return None, None, None
+
+    word_clean = clean_word_for_url(word)
+    query = quote_plus(str(word).strip())
+    page_urls = []
+
+    if word_clean:
+        page_urls.append(f"{BASE_URL}/definition/english/{word_clean}?q={query}")
+    page_urls.append(f"{BASE_URL}/search/english/?q={query}")
+
+    visited = set()
+    queue = list(page_urls)
+    followed_links = 0
+
+    while queue:
+        page_url = queue.pop(0)
+        if page_url in visited:
+            continue
+        visited.add(page_url)
+
+        try:
+            headers = get_human_headers()
+            response = requests.get(page_url, timeout=10, headers=headers)
+        except Exception as e:
+            logging.debug(f"Oxford page lookup failed for {page_url}: {e}")
+            continue
+
+        for audio_url in extract_audio_urls_from_oxford_html(response.text):
+            if not is_relevant_audio_url(audio_url, word, response.url):
+                continue
+            if try_url(audio_url):
+                resolved_definition_url = response.url if is_definition_entry_url(response.url) else None
+                return audio_url, audio_url.split("/")[-1], resolved_definition_url
+
+        # If Oxford already resolved to a concrete entry page and it still doesn't expose
+        # relevant audio for this query, don't wander into related-entry links.
+        if is_definition_entry_url(response.url):
+            continue
+
+        if followed_links >= max_link_follows:
+            continue
+
+        for linked_page in extract_definition_entry_links(response.text, response.url):
+            if linked_page in visited or linked_page in queue:
+                continue
+            queue.append(linked_page)
+            followed_links += 1
+            if followed_links >= max_link_follows:
+                break
+
+    return None, None, None
+
 def find_working_audio_url(word):
     """Find a working audio URL for the given word"""
     if not word or pd.isna(word):
-        return None, None
+        return None, None, None
         
     candidates = construct_candidate_urls(word)
     for url in candidates:
         if try_url(url):
-            return url, url.split('/')[-1]
+            return url, url.split('/')[-1], None
+
+    return find_audio_on_oxford_pages(word)
+
+def generate_tts_fallback_audio(word, output_folder):
+    """Placeholder for local TTS fallback when Oxford audio is unavailable."""
+    # TODO: When no Oxford clip is found, synthesize audio with the local
+    # Qwen3-TTS MLX model at LOCAL_TTS_FALLBACK_MODEL.
+    # Follow the mlx-audio example from the model card:
+    # - CLI: python -m mlx_audio.tts.generate --model <model-path> --text "<word>"
+    # - Python: load_model(...) + generate_audio(...)
+    # Store the generated file in output_folder and return (audio_url_or_path, filename).
     return None, None
 
 def construct_definition_url(word):
@@ -358,18 +561,20 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
                 
                 # Find working audio URL
                 print(f"  Searching for audio...")
-                audio_url, filename = find_working_audio_url(word)
+                audio_url, filename, resolved_definition_url = find_working_audio_url(word)
                 
                 # Construct definition URL
-                definition_url = construct_definition_url(word)
+                definition_url = resolved_definition_url or construct_definition_url(word)
                 
                 # Check if resources exist
                 has_audio = audio_url is not None
-                has_definition = check_definition_url(definition_url) if definition_url else False
+                has_definition = bool(resolved_definition_url) or (check_definition_url(definition_url) if definition_url else False)
 
                 if not has_audio:
                     logging.warning(f"Audio not found for word: {word}")
                     print(f"  ✗ No audio found")
+                    # TODO: Call generate_tts_fallback_audio(word, audio_dir) here as a
+                    # final fallback once the local Qwen3-TTS integration is implemented.
                 else:
                     print(f"  ✓ Audio found: {filename}")
                     successful_audio += 1

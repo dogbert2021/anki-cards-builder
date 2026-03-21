@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 import re
 from selenium import webdriver
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
 from selenium.webdriver.common.by import By
 
 from selenium.webdriver.chrome.options import Options
@@ -42,6 +43,15 @@ def create_selenium_driver():
     except Exception as e:
         logging.error(f"Failed to create Selenium driver: {e}")
         return None
+
+def restart_selenium_driver(driver):
+    """Restart the shared Selenium driver after a browser/session failure."""
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    return create_selenium_driver()
 
 def get_onelook_definition_selenium(word, driver, delay_range=(2, 6)):
     """Fetch OneLook definition using a shared Selenium driver."""
@@ -86,6 +96,13 @@ def get_onelook_definition_selenium(word, driver, delay_range=(2, 6)):
 
         return definition
 
+    except (InvalidSessionIdException, WebDriverException) as e:
+        message = str(e).lower()
+        if any(marker in message for marker in ("invalid session id", "session deleted", "not connected to devtools")):
+            logging.error(f"Selenium session lost while fetching OneLook definition for '{word}': {e}")
+            raise
+        print(f"Error fetching OneLook definition for '{word}': {e}")
+        return None
     except Exception as e:
         print(f"Error fetching OneLook definition for '{word}': {e}")
         return None
@@ -269,6 +286,7 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
         for col in required_columns:
             if col not in df.columns:
                 df[col] = ''
+            df[col] = df[col].astype('object')
         
         # Filter out empty Front values
         original_count = len(df)
@@ -307,8 +325,25 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
                     print(f"  Fetching OneLook definition...")
                     if verbose:
                         print(f"  🔍 Debug mode: detailed OneLook analysis for '{word}'")
-                    
-                    onelook_def = get_onelook_definition_selenium(word, driver)
+
+                    try:
+                        onelook_def = get_onelook_definition_selenium(word, driver)
+                    except (InvalidSessionIdException, WebDriverException):
+                        print(f"  ⚠️ Selenium session dropped, restarting browser and retrying...")
+                        logging.warning(f"Selenium session dropped while fetching '{word}'. Restarting driver.")
+                        driver = restart_selenium_driver(driver)
+                        if driver is None:
+                            print(f"  ⚠️ Unable to restart Selenium; skipping OneLook definition")
+                            onelook_def = None
+                        else:
+                            try:
+                                onelook_def = get_onelook_definition_selenium(word, driver)
+                            except (InvalidSessionIdException, WebDriverException) as retry_error:
+                                logging.error(f"Selenium retry failed for '{word}': {retry_error}")
+                                print(f"  ⚠️ Selenium retry failed; skipping OneLook definition")
+                                driver = None
+                                onelook_def = None
+
                     print(f"{word}: {onelook_def}")
 
 

@@ -1,0 +1,3 @@
+.venv/*
+audio/*
+anki_audio_fetcher.log

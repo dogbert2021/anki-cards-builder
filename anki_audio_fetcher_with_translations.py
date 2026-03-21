@@ -1,9 +1,11 @@
 import os
+import json
 import pandas as pd
 import requests
 import logging
 import time
 import random
+import subprocess
 from datetime import datetime
 import re
 from selenium import webdriver
@@ -14,6 +16,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup, NavigableString, Tag
+from pathlib import Path
 from urllib.parse import quote_plus, urljoin, urlparse
 
 
@@ -30,6 +33,8 @@ BASE_URL = "https://www.oxfordlearnersdictionaries.com"
 AUDIO_BASE = f"{BASE_URL}/media/english/us_pron_ogg"
 ONELOOK_BASE = "https://onelook.com"
 LOCAL_TTS_FALLBACK_MODEL = "/Users/alekseiplotnitskii/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+LOCAL_TTS_RUNTIME_PYTHON = str(Path(__file__).resolve().parent / ".venv-tts" / "bin" / "python")
+LOCAL_TTS_HELPER_SCRIPT = str(Path(__file__).resolve().parent / "qwen_tts_fallback.py")
 
 def create_selenium_driver():
     """Create a single headless Chrome driver for OneLook scraping."""
@@ -412,14 +417,98 @@ def find_working_audio_url(word):
     return find_audio_on_oxford_pages(word)
 
 def generate_tts_fallback_audio(word, output_folder):
-    """Placeholder for local TTS fallback when Oxford audio is unavailable."""
-    # TODO: When no Oxford clip is found, synthesize audio with the local
-    # Qwen3-TTS MLX model at LOCAL_TTS_FALLBACK_MODEL.
-    # Follow the mlx-audio example from the model card:
-    # - CLI: python -m mlx_audio.tts.generate --model <model-path> --text "<word>"
-    # - Python: load_model(...) + generate_audio(...)
-    # Store the generated file in output_folder and return (audio_url_or_path, filename).
-    return None, None
+    """Generate fallback audio locally via the dedicated Python 3.11 TTS runtime."""
+    if not word or pd.isna(word):
+        return None, None
+
+    runtime_python = Path(LOCAL_TTS_RUNTIME_PYTHON)
+    helper_script = Path(LOCAL_TTS_HELPER_SCRIPT)
+    if not runtime_python.exists():
+        logging.error(f"TTS runtime python not found: {runtime_python}")
+        return None, None
+    if not helper_script.exists():
+        logging.error(f"TTS helper script not found: {helper_script}")
+        return None, None
+
+    output_dir = Path(output_folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    file_prefix = f"{clean_word_for_url(word)}__tts"
+    output_path = output_dir / f"{file_prefix}.wav"
+    relative_audio_path = str(output_path)
+    if output_path.exists():
+        return relative_audio_path, output_path.name
+
+    command = [
+        str(runtime_python),
+        str(helper_script),
+        "--model-path",
+        LOCAL_TTS_FALLBACK_MODEL,
+        "--text",
+        str(word).strip(),
+        "--output-dir",
+        str(output_dir),
+        "--file-prefix",
+        file_prefix,
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except Exception as e:
+        logging.error(f"TTS fallback execution failed for '{word}': {e}")
+        return None, None
+
+    marker = "TTS_RESULT_JSON="
+    combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    payload = None
+    for line in combined_output.splitlines():
+        if line.startswith(marker):
+            try:
+                payload = json.loads(line[len(marker):])
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse TTS fallback payload for '{word}': {e}")
+            break
+
+    if result.returncode != 0:
+        logging.error(
+            f"TTS fallback process failed for '{word}' with code {result.returncode}: {combined_output[-2000:]}"
+        )
+        return None, None
+
+    if not payload:
+        logging.error(f"TTS fallback produced no result payload for '{word}': {combined_output[-2000:]}")
+        return None, None
+
+    generated_path = payload.get("output_path")
+    generated_filename = payload.get("filename")
+    if not generated_path or not generated_filename:
+        logging.error(f"TTS fallback returned incomplete payload for '{word}': {payload}")
+        return None, None
+
+    generated_file = Path(generated_path)
+    if not generated_file.exists():
+        logging.error(f"TTS fallback output file missing for '{word}': {generated_file}")
+        return None, None
+
+    return relative_audio_path, generated_filename
+
+def is_local_audio_file(audio_reference, audio_dir):
+    """Check whether the audio reference points to an existing local file in audio_dir."""
+    if not audio_reference:
+        return False
+
+    try:
+        audio_path = Path(audio_reference).expanduser().resolve()
+        base_dir = Path(audio_dir).expanduser().resolve()
+        return audio_path.exists() and audio_path.is_file() and base_dir in audio_path.parents
+    except Exception:
+        return False
 
 def construct_definition_url(word):
     """Construct Oxford definition URL"""
@@ -573,8 +662,16 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
                 if not has_audio:
                     logging.warning(f"Audio not found for word: {word}")
                     print(f"  ✗ No audio found")
-                    # TODO: Call generate_tts_fallback_audio(word, audio_dir) here as a
-                    # final fallback once the local Qwen3-TTS integration is implemented.
+                    print(f"  Attempting local TTS fallback...")
+                    tts_audio_path, tts_filename = generate_tts_fallback_audio(word, audio_dir)
+                    if tts_audio_path and tts_filename:
+                        audio_url = tts_audio_path
+                        filename = tts_filename
+                        has_audio = True
+                        successful_audio += 1
+                        print(f"  ✓ TTS audio generated: {filename}")
+                    else:
+                        print(f"  ✗ TTS fallback unavailable")
                 else:
                     print(f"  ✓ Audio found: {filename}")
                     successful_audio += 1
@@ -591,10 +688,15 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
 
                 # Download audio if found
                 if has_audio:
-                    print(f"  Downloading audio...")
-                    if download_audio(audio_url, audio_dir):
+                    if is_local_audio_file(audio_url, audio_dir):
                         download_success = True
-                        print(f"  ✓ Audio downloaded successfully")
+                        print(f"  ✓ Audio already generated locally")
+                    else:
+                        print(f"  Downloading audio...")
+                    if download_success or download_audio(audio_url, audio_dir):
+                        download_success = True
+                        if not is_local_audio_file(audio_url, audio_dir):
+                            print(f"  ✓ Audio downloaded successfully")
                         # Update Back column with Anki sound tag
                         current_back = str(df.at[index, 'Back']).strip()
                         if current_back and not is_empty_value(current_back):

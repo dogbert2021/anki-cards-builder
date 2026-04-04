@@ -35,6 +35,7 @@ ONELOOK_BASE = "https://onelook.com"
 LOCAL_TTS_FALLBACK_MODEL = "/Users/alekseiplotnitskii/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 LOCAL_TTS_RUNTIME_PYTHON = str(Path(__file__).resolve().parent / ".venv-tts" / "bin" / "python")
 LOCAL_TTS_HELPER_SCRIPT = str(Path(__file__).resolve().parent / "qwen_tts_fallback.py")
+LOCAL_TTS_OUTPUT_FORMAT = "ogg"
 
 def create_selenium_driver():
     """Create a single headless Chrome driver for OneLook scraping."""
@@ -434,7 +435,7 @@ def generate_tts_fallback_audio(word, output_folder):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     file_prefix = f"{clean_word_for_url(word)}__tts"
-    output_path = output_dir / f"{file_prefix}.wav"
+    output_path = output_dir / f"{file_prefix}.{LOCAL_TTS_OUTPUT_FORMAT}"
     relative_audio_path = str(output_path)
     if output_path.exists():
         return relative_audio_path, output_path.name
@@ -450,6 +451,8 @@ def generate_tts_fallback_audio(word, output_folder):
         str(output_dir),
         "--file-prefix",
         file_prefix,
+        "--output-format",
+        LOCAL_TTS_OUTPUT_FORMAT,
     ]
 
     try:
@@ -496,7 +499,7 @@ def generate_tts_fallback_audio(word, output_folder):
         logging.error(f"TTS fallback output file missing for '{word}': {generated_file}")
         return None, None
 
-    return relative_audio_path, generated_filename
+    return str(output_dir / generated_filename), generated_filename
 
 def is_local_audio_file(audio_reference, audio_dir):
     """Check whether the audio reference points to an existing local file in audio_dir."""

@@ -570,7 +570,18 @@ def is_empty_value(value):
         return True
     return False
 
-def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
+def append_sound_tag(back_value, filename):
+    """Append an Anki sound tag without duplicating it on repeated runs."""
+    sound_tag = f"[sound:{filename}]"
+    if is_empty_value(back_value):
+        return sound_tag
+
+    back_text = str(back_value).strip()
+    if sound_tag in back_text:
+        return back_text
+    return f"{back_text} {sound_tag}"
+
+def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False, tts_only=False):
     """Process CSV file to fetch audio and definitions"""
     try:
         # Read CSV with proper handling of empty values
@@ -598,14 +609,16 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
             return
         
         print(f"Processing {total_words} words...")
+        if tts_only:
+            print("TTS-only mode enabled: skipping OneLook, Oxford lookup, and downloads.")
         if verbose:
             print(f"🔧 Debug mode enabled - will save HTML files and show detailed logs")
         
         successful_audio = 0
         successful_definitions = 0
         successful_onelook = 0
-        driver = create_selenium_driver()
-        if driver is None:
+        driver = None if tts_only else create_selenium_driver()
+        if not tts_only and driver is None:
             print("⚠️  Unable to start Selenium; OneLook definitions will be skipped.")
         
         try:
@@ -613,6 +626,23 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
                 word = str(row['Front']).strip()
                 
                 print(f"\n[{index+1}/{total_words}] Processing: '{word}'")
+
+                if tts_only:
+                    print(f"  Generating local TTS audio...")
+                    tts_audio_path, tts_filename = generate_tts_fallback_audio(word, audio_dir)
+
+                    if tts_audio_path and tts_filename and is_local_audio_file(tts_audio_path, audio_dir):
+                        successful_audio += 1
+                        df.at[index, 'Back'] = append_sound_tag(row.get('Back', ''), tts_filename)
+                        df.at[index, 'Audio'] = tts_audio_path
+                        df.at[index, 'DL valid'] = True
+                        print(f"  ✓ TTS audio ready: {tts_filename}")
+                    else:
+                        df.at[index, 'Audio'] = ""
+                        df.at[index, 'DL valid'] = False
+                        print(f"  ✗ TTS generation failed")
+
+                    continue
                 
                 # Check if Back column is empty and fetch OneLook definition
                 current_back = row.get('Back', '')
@@ -701,12 +731,7 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
                         if not is_local_audio_file(audio_url, audio_dir):
                             print(f"  ✓ Audio downloaded successfully")
                         # Update Back column with Anki sound tag
-                        current_back = str(df.at[index, 'Back']).strip()
-                        if current_back and not is_empty_value(current_back):
-                            # Add sound tag to existing content
-                            df.at[index, 'Back'] = f"{current_back} [sound:{filename}]"
-                        else:
-                            df.at[index, 'Back'] = f"[sound:{filename}]"
+                        df.at[index, 'Back'] = append_sound_tag(df.at[index, 'Back'], filename)
                     else:
                         print(f"  ✗ Audio download failed")
 
@@ -738,8 +763,9 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
         print(f"\n📊 Summary:")
         print(f"  Total words processed: {total_words}")
         print(f"  Audio files found: {successful_audio}")
-        print(f"  Oxford definition pages found: {successful_definitions}")
-        print(f"  OneLook definitions added: {successful_onelook}")
+        if not tts_only:
+            print(f"  Oxford definition pages found: {successful_definitions}")
+            print(f"  OneLook definitions added: {successful_onelook}")
         
     except FileNotFoundError:
         print(f"❌ Error: Input file '{input_csv}' not found!")
@@ -756,11 +782,16 @@ def process_csv(input_csv, output_csv, audio_dir="audio", verbose=False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Fetch Oxford audio, definitions, and OneLook translations for word list.")
+    parser = argparse.ArgumentParser(description="Fetch audio and definitions for Anki word cards.")
     parser.add_argument("input_csv", help="Input CSV file with 'Front' column")
     parser.add_argument("output_csv", help="Output CSV file to save results")
     parser.add_argument("--audio_dir", default="audio", help="Directory to save audio files")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--tts-only",
+        action="store_true",
+        help="Generate local TTS audio only; skip OneLook definitions and Oxford lookups",
+    )
 
     args = parser.parse_args()
-    process_csv(args.input_csv, args.output_csv, args.audio_dir, args.verbose)
+    process_csv(args.input_csv, args.output_csv, args.audio_dir, args.verbose, args.tts_only)

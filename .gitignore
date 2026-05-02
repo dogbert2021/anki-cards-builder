@@ -1,4 +1,5 @@
 .venv/*
+.venv-tts/*
 audio/*
 anki_audio_fetcher.log
 anki_audio_fetcher_out.csv
